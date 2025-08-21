@@ -1,0 +1,74 @@
+Help me upgrade my movie recommendation scoring logic. The core system is already in place. I want to enhance each part with the improvements below. Everything should remain explainable and rule-based (no ML). Please integrate all of the following:
+
+✅ 1. Genre Matching
+Replace top-3 genre match with a genre frequency vector:
+
+Count how many times each genre appears in the user's 4 liked movies.
+
+For each candidate, add 10 points per matching genre, weighted by how frequently that genre appeared.
+
+✅ 2. User Feedback Learning
+Analyze the last 20 feedback entries.
+
+For each candidate:
+
++12 points for every genre that was liked
+
+-8 points for every genre that was disliked (unless that genre was also liked — prioritize likes)
+
+✅ 3. Rating Quality
+Base score on vote_average:
+
+8.0+ → +10
+
+7.5–7.9 → +6
+
+7.0–7.4 → +2
+
+<6.0 → -10
+
+Add +2 if vote_count >= 1000 (social proof bonus)
+
+Optional: experiment with vote_average * log(vote_count + 1) as an alternate scoring factor
+
+✅ 4. Popularity Decay
+Give +8 points if popularity is between 20 and 150
+
+Subtract -2 points if popularity is over 300
+
+No penalty if under 10, but deprioritize them unless score is otherwise strong
+
+You can smooth this using a decay function or curve if needed
+
+✅ 5. Content Safety Filter
+Filter out any candidate where:
+
+adult = true
+
+Title contains keywords like “porn”, “xxx”, “hardcore”
+
+Allow R-rated or mature movies, as long as they are not explicitly pornographic
+
+🔁 6. Collaborative Filtering Approximation (Optional Enhancement)
+For each movie the user liked, call TMDB’s /movie/{id}/similar
+
+Build a list of suggested candidates from those results
+
+If a candidate appears in this set, add +10 points
+
+This adds “users who liked X also liked Y” behavior, without needing user-user data
+
+🧠 7. Emotional / Tonal Matching
+Create a set of tone-based keyword themes (e.g. "inspirational", "dark", "uplifting", "tragic", etc.)
+
+Infer dominant tone from user’s 4 liked movies using:
+
+Common keywords from TMDB's /movie/{id} or /keywords
+
+Genre combinations (e.g., Drama + Biography → likely inspirational)
+
+For each candidate, if tone keywords overlap with the inferred tone profile:
+
+Add +5 points per match
+
+Wrap all of this into your scoring system. Return top 5 recommendations based on the combined score. Keep it modular and readable so each scoring factor is easy to test and update.
