@@ -1,0 +1,18 @@
+[project]
+name = "movie-recommendation-app"
+version = "1.0.0"
+description = "A Flask-based movie recommendation application using TMDB API"
+requires-python = ">=3.11"
+dependencies = [
+    "Flask>=3.0.0",
+    "Flask-SQLAlchemy>=3.1.1",
+    "requests>=2.31.0",
+    "psycopg2-binary>=2.9.9",
+    "gunicorn>=21.2.0",
+    "email-validator>=2.1.0"
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+

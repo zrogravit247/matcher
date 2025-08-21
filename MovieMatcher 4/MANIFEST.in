@@ -1,0 +1,18 @@
+# MANIFEST.in - Package data inclusion for deployment
+# Ensures all necessary files are included in the deployment package
+
+include *.py
+include *.md
+include *.txt
+include *.sh
+recursive-include templates *.html
+recursive-include static *.css *.js *.png *.jpg *.jpeg *.svg *.ico
+recursive-include static/css *
+recursive-include static/js *
+recursive-include static/icons *
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .git*
+global-exclude *.lock
+global-exclude uv.lock
+global-exclude uv-lock.json
