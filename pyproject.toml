@@ -5,9 +5,8 @@ description = "A Flask-based movie recommendation application using TMDB API"
 requires-python = ">=3.11"
 dependencies = [
     "Flask",
-    "Flask-SQLAlchemy", 
+    "Flask-SQLAlchemy",
     "requests",
-    "psycopg2-binary",
     "gunicorn",
     "email-validator"
 ]

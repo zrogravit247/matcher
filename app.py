@@ -1,7 +1,8 @@
 import os
 import json
+import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, render_template, request, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import DeclarativeBase
@@ -16,8 +17,11 @@ db = SQLAlchemy(model_class=Base)
 app = Flask(__name__)
 # setup a secret key, required by sessions
 app.secret_key = os.environ.get("SESSION_SECRET") or os.environ.get("FLASK_SECRET_KEY") or "dev-secret-key-change-in-production"
-# configure the database, relative to the app instance folder
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
+# configure the database. Defaults to a local SQLite file so the app runs
+# with zero external dependencies; set DATABASE_URL to point at Postgres or
+# a mounted SQLite volume in production.
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL") or f"sqlite:///{os.path.join(basedir, 'matcher.db')}"
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_recycle": 300,
     "pool_pre_ping": True,
@@ -32,12 +36,40 @@ with app.app_context():
     db.create_all()
 
 # TMDB API configuration
-TMDB_API_KEY = "a4747b23774690ec1831568f642ff364"
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+if not TMDB_API_KEY:
+    print("WARNING: TMDB_API_KEY is not set. Movie/TV search and recommendations will fail.")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
 # Google Books API configuration
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GOOGLE_BOOKS_BASE_URL = "https://www.googleapis.com/books/v1"
+
+# Shared connection-pooled session for all outbound API calls (reuses TCP/TLS
+# connections instead of opening a new one per request).
+http = requests.Session()
+
+# Simple in-process TTL cache for outbound API responses. Search/suggestion
+# queries and genre-based discover results repeat a lot across users, so
+# caching them cuts outbound API calls significantly. Not shared across
+# processes/workers, which is fine at this app's scale.
+_cache = {}
+_CACHE_MAX_ENTRIES = 500
+
+def cache_get(key):
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    value, expires_at = entry
+    if time.time() > expires_at:
+        del _cache[key]
+        return None
+    return value
+
+def cache_set(key, value, ttl_seconds):
+    if len(_cache) >= _CACHE_MAX_ENTRIES:
+        _cache.clear()
+    _cache[key] = (value, time.time() + ttl_seconds)
 
 def get_or_create_user():
     """Get or create a user based on session"""
@@ -221,18 +253,21 @@ def search_movie():
     query = request.args.get('query', '')
     if not query:
         return jsonify([])
-    
+
     try:
-        url = f"{TMDB_BASE_URL}/search/movie"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'query': query
-        }
-        
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        
+        cache_key = ('search_movie', query)
+        data = cache_get(cache_key)
+        if data is None:
+            url = f"{TMDB_BASE_URL}/search/movie"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'query': query
+            }
+            response = http.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds=600)
+
         movies = []
         for movie in data.get('results', [])[:10]:
             if movie.get('poster_path'):
@@ -256,18 +291,21 @@ def search_tv():
     query = request.args.get('query', '')
     if not query:
         return jsonify([])
-    
+
     try:
-        url = f"{TMDB_BASE_URL}/search/tv"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'query': query
-        }
-        
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        
+        cache_key = ('search_tv', query)
+        data = cache_get(cache_key)
+        if data is None:
+            url = f"{TMDB_BASE_URL}/search/tv"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'query': query
+            }
+            response = http.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds=600)
+
         tv_series = []
         for tv in data.get('results', [])[:10]:
             if tv.get('poster_path'):
@@ -291,18 +329,21 @@ def get_movie_suggestions():
     query = request.args.get('query', '')
     if not query or len(query) < 2:
         return jsonify([])
-    
+
     try:
-        url = f"{TMDB_BASE_URL}/search/movie"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'query': query
-        }
-        
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        
+        cache_key = ('search_movie', query)
+        data = cache_get(cache_key)
+        if data is None:
+            url = f"{TMDB_BASE_URL}/search/movie"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'query': query
+            }
+            response = http.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds=600)
+
         suggestions = []
         for movie in data.get('results', [])[:5]:
             suggestions.append({
@@ -324,18 +365,21 @@ def get_tv_suggestions():
     query = request.args.get('query', '')
     if not query or len(query) < 2:
         return jsonify([])
-    
+
     try:
-        url = f"{TMDB_BASE_URL}/search/tv"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'query': query
-        }
-        
-        response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        
+        cache_key = ('search_tv', query)
+        data = cache_get(cache_key)
+        if data is None:
+            url = f"{TMDB_BASE_URL}/search/tv"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'query': query
+            }
+            response = http.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds=600)
+
         suggestions = []
         for tv in data.get('results', [])[:5]:
             suggestions.append({
@@ -390,17 +434,20 @@ def get_book_suggestions():
 def fetch_google_books(query, excluded_ids, max_results=10):
     """Fetch books from Google Books API"""
     try:
-        search_url = f"{GOOGLE_BOOKS_BASE_URL}/volumes"
-        params = {
-            'q': query,
-            'maxResults': max_results,
-            'key': GOOGLE_BOOKS_API_KEY
-        }
-        
-        response = requests.get(search_url, params=params, timeout=3)
-        response.raise_for_status()
-        data = response.json()
-        
+        cache_key = ('google_books', query, max_results)
+        data = cache_get(cache_key)
+        if data is None:
+            search_url = f"{GOOGLE_BOOKS_BASE_URL}/volumes"
+            params = {
+                'q': query,
+                'maxResults': max_results,
+                'key': GOOGLE_BOOKS_API_KEY
+            }
+            response = http.get(search_url, params=params, timeout=3)
+            response.raise_for_status()
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds=600)
+
         books = []
         if 'items' in data:
             for item in data['items']:
@@ -654,19 +701,24 @@ def get_movie_recommendation():
         all_candidates = []
         
         # Discover movies by genre
-        discover_url = f"{TMDB_BASE_URL}/discover/movie"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'with_genres': ','.join(primary_genres),
-            'sort_by': 'vote_average.desc',
-            'vote_count.gte': 100,
-            'page': 1
-        }
-        
-        response = requests.get(discover_url, params=params, timeout=10)
-        if response.ok:
-            data = response.json()
-            all_candidates.extend(data.get('results', []))
+        discover_cache_key = ('discover_movie', ','.join(primary_genres))
+        discover_data = cache_get(discover_cache_key)
+        if discover_data is None:
+            discover_url = f"{TMDB_BASE_URL}/discover/movie"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'with_genres': ','.join(primary_genres),
+                'sort_by': 'vote_average.desc',
+                'vote_count.gte': 100,
+                'page': 1
+            }
+            response = http.get(discover_url, params=params, timeout=10)
+            if response.ok:
+                discover_data = response.json()
+                cache_set(discover_cache_key, discover_data, ttl_seconds=900)
+
+        if discover_data:
+            all_candidates.extend(discover_data.get('results', []))
         
         # Advanced movie scoring system
         scored_candidates = []
@@ -851,19 +903,24 @@ def get_tv_recommendation():
         all_candidates = []
         
         # Discover TV series by genre
-        discover_url = f"{TMDB_BASE_URL}/discover/tv"
-        params = {
-            'api_key': TMDB_API_KEY,
-            'with_genres': ','.join(primary_genres),
-            'sort_by': 'vote_average.desc',
-            'vote_count.gte': 50,
-            'page': 1
-        }
-        
-        response = requests.get(discover_url, params=params, timeout=10)
-        if response.ok:
-            data = response.json()
-            all_candidates.extend(data.get('results', []))
+        discover_cache_key = ('discover_tv', ','.join(primary_genres))
+        discover_data = cache_get(discover_cache_key)
+        if discover_data is None:
+            discover_url = f"{TMDB_BASE_URL}/discover/tv"
+            params = {
+                'api_key': TMDB_API_KEY,
+                'with_genres': ','.join(primary_genres),
+                'sort_by': 'vote_average.desc',
+                'vote_count.gte': 50,
+                'page': 1
+            }
+            response = http.get(discover_url, params=params, timeout=10)
+            if response.ok:
+                discover_data = response.json()
+                cache_set(discover_cache_key, discover_data, ttl_seconds=900)
+
+        if discover_data:
+            all_candidates.extend(discover_data.get('results', []))
         
         # Advanced TV series scoring system
         scored_candidates = []
@@ -1006,6 +1063,22 @@ def get_tv_recommendation():
         
     except Exception as e:
         return jsonify({'error': f'Failed to get recommendation: {str(e)}'}), 500
+
+@app.cli.command("cleanup-users")
+def cleanup_users():
+    """Delete anonymous users (and their cascaded data) created more than 90 days ago.
+
+    Anonymous sessions are never explicitly deleted, so the User table grows
+    forever without this. Run periodically (e.g. via a scheduled job on your
+    host) to keep the database small.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=90)
+    stale_users = models.User.query.filter(models.User.created_at < cutoff).all()
+    count = len(stale_users)
+    for user in stale_users:
+        db.session.delete(user)
+    db.session.commit()
+    print(f"Deleted {count} user(s) created before {cutoff.isoformat()}.")
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)

@@ -323,25 +323,9 @@ class MovieRecommendationApp {
 
     async handleLikeFeedback(liked) {
         if (!this.currentRecommendation) return;
-        
-        try {
-            await fetch('/recommendation_feedback', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    movie_id: this.currentRecommendation.id,
-                    liked: liked
-                })
-            });
-            
-            this.updateFeedbackButtons(liked);
-            setTimeout(() => this.getAnotherRecommendation(), 1000);
-            
-        } catch (error) {
-            console.error('Error sending feedback:', error);
-        }
+
+        this.updateFeedbackButtons(liked);
+        setTimeout(() => this.getAnotherRecommendation(), 1000);
     }
 
     updateFeedbackButtons(liked) {
