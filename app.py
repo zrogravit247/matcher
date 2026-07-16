@@ -405,18 +405,14 @@ def search_book():
         query = request.args.get('query', '')
     
     if not query:
-        return jsonify({'book': None})
-    
+        return jsonify([])
+
     try:
         books = fetch_google_books(query, set(), max_results=5)
-        if books:
-            # Return the best match (first result)
-            return jsonify({'book': books[0]})
-        else:
-            return jsonify({'book': None})
+        return jsonify(books)
     except Exception as e:
         print(f"Error searching for book: {e}")
-        return jsonify({'book': None})
+        return jsonify([])
 
 @app.route('/get_book_suggestions')
 def get_book_suggestions():
