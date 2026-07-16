@@ -26,7 +26,11 @@ class UserMovie(db.Model):
 class Recommendation(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    tmdb_id = db.Column(db.Integer, nullable=False)
+    # 'movie' | 'tv' | 'book'. Movie/TV ids are numeric TMDB ids; book ids are
+    # alphanumeric Google Books ids, so tmdb_id is a string and exclusion
+    # queries must be scoped by content_type rather than assuming int(tmdb_id).
+    content_type = db.Column(db.String(10), nullable=False, default='movie')
+    tmdb_id = db.Column(db.String(32), nullable=False)
     title = db.Column(db.String(255), nullable=False)
     release_date = db.Column(db.String(20))
     poster_path = db.Column(db.String(255))

@@ -2,6 +2,7 @@ import os
 import json
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -70,6 +71,26 @@ def cache_set(key, value, ttl_seconds):
     if len(_cache) >= _CACHE_MAX_ENTRIES:
         _cache.clear()
     _cache[key] = (value, time.time() + ttl_seconds)
+
+def fetch_json_cached(url, params, cache_key, ttl_seconds=900, timeout=5):
+    """GET url (or return a cached response) as JSON, or None on failure.
+
+    Used for batches of calls fetched concurrently via ThreadPoolExecutor, so
+    the timeout is kept short - one slow/stuck call shouldn't drag the whole
+    batch's wall-clock time up to a long timeout when the others finish fast.
+    """
+    data = cache_get(cache_key)
+    if data is not None:
+        return data
+    try:
+        response = http.get(url, params=params, timeout=timeout)
+        if response.ok:
+            data = response.json()
+            cache_set(cache_key, data, ttl_seconds)
+            return data
+    except requests.RequestException:
+        pass
+    return None
 
 def get_or_create_user():
     """Get or create a user based on session"""
@@ -493,21 +514,41 @@ def get_book_recommendation():
             user_categories.extend(book.get('categories', []))
             user_authors.extend(book.get('authors', []))
             excluded_ids.add(book.get('id'))
-        
-        # Get category preferences
+
+        # Exclude previous book recommendations for variety. Scoped to
+        # content_type='book' since movie/tv recommendations share this table
+        # but use numeric TMDB ids rather than Google Books ids.
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='book').all()
+        for rec in previous_recommendations:
+            excluded_ids.add(rec.tmdb_id)
+
+        # Get category and author preferences
         category_counts = {}
         for category in user_categories:
             category_counts[category] = category_counts.get(category, 0) + 1
-        
-        # Search for recommendations using top categories
+
+        author_counts = {}
+        for author in user_authors:
+            author_counts[author] = author_counts.get(author, 0) + 1
+
+        # Search for recommendations using top categories (broad thematic
+        # discovery) and top authors (precise "more like this author" - a
+        # much stronger signal than category text, which Google Books tags
+        # inconsistently).
         all_candidates = []
         top_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        
+        top_authors = sorted(author_counts.items(), key=lambda x: x[1], reverse=True)[:2]
+
         for category, _ in top_categories:
             search_query = f"subject:{category}"
             candidates = fetch_google_books(search_query, excluded_ids, max_results=20)
             all_candidates.extend(candidates)
-        
+
+        for author, _ in top_authors:
+            search_query = f'inauthor:"{author}"'
+            candidates = fetch_google_books(search_query, excluded_ids, max_results=15)
+            all_candidates.extend(candidates)
+
         # Remove duplicates
         seen_ids = set()
         unique_candidates = []
@@ -521,8 +562,12 @@ def get_book_recommendation():
         
         # Advanced scoring with diversity factors
         scored_candidates = []
-        
+        current_year = datetime.utcnow().year
+
         for book in unique_candidates:
+            if not book.get('overview'):
+                continue
+
             score = 0
             book_categories = book.get('categories', [])
             book_authors = book.get('authors', [])
@@ -534,11 +579,14 @@ def get_book_recommendation():
                     category_matches += 1
                     score += max(15 - (category_matches * 3), 5) * category_counts[category]
             
-            # Author diversity bonus
-            if not any(author in user_authors for author in book_authors):
-                score += 8
+            # Author match: a book by an author the user already likes is a
+            # high-precision recommendation (and is now deliberately fetched
+            # via the inauthor: search above), so it shouldn't score below
+            # diversity picks - just slightly, to leave room for discovery.
+            if any(author in user_authors for author in book_authors):
+                score += 10
             else:
-                score += 3
+                score += 6
             
             # Rating quality
             rating = book.get('vote_average', 0)
@@ -554,11 +602,11 @@ def get_book_recommendation():
             if pub_date:
                 try:
                     year = int(pub_date[:4])
-                    if 2020 <= year <= 2024:
+                    if year >= current_year - 5:
                         score += 3
-                    elif 2010 <= year <= 2019:
+                    elif year >= current_year - 15:
                         score += 2
-                    elif 1990 <= year <= 2009:
+                    elif year >= 1990:
                         score += 1
                     elif year < 1990:
                         score += 4
@@ -583,11 +631,11 @@ def get_book_recommendation():
             recommendation = unique_candidates[0] if unique_candidates else None
             reasoning = "Discovered based on thematic connections to your reading preferences."
         else:
-            # Weighted random selection
+            # Weighted random selection, biased toward the strongest matches
             scored_candidates.sort(key=lambda x: x[1], reverse=True)
-            
+
             import random
-            top_count = min(8, len(scored_candidates))
+            top_count = min(5, len(scored_candidates))
             weights = [max(1, score) for _, score in scored_candidates[:top_count]]
             recommendation, score = random.choices(scored_candidates[:top_count], weights=weights)[0]
             
@@ -605,7 +653,7 @@ def get_book_recommendation():
                 reasoning_parts.append(f"Thematically connected to your taste for {', '.join([book.get('title', '') for book in user_books[:2]])}.")
             
             pub_year = recommendation.get('published_date', '')[:4] if recommendation.get('published_date') else ''
-            if pub_year and int(pub_year) >= 2020:
+            if pub_year and int(pub_year) >= current_year - 5:
                 reasoning_parts.append("A highly acclaimed recent release.")
             elif pub_year and int(pub_year) < 1980:
                 reasoning_parts.append("A timeless classic that shaped literature.")
@@ -628,7 +676,8 @@ def get_book_recommendation():
         try:
             db_recommendation = models.Recommendation(
                 user_id=user.id,
-                tmdb_id=recommendation.get('id', ''),
+                content_type='book',
+                tmdb_id=str(recommendation.get('id', '')),
                 title=recommendation.get('title', ''),
                 release_date=recommendation.get('published_date', ''),
                 poster_path=recommendation.get('poster_path', ''),
@@ -679,43 +728,82 @@ def get_movie_recommendation():
             {'id': 37, 'name': 'Western'}
         ]
         
-        # Exclude previous recommendations for variety
-        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id).all()
+        # Exclude previous movie recommendations for variety. Scoped to
+        # content_type='movie' since tv/book recommendations share this table
+        # but use different id formats (book ids aren't numeric TMDB ids).
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='movie').all()
         for rec in previous_recommendations:
             excluded_ids.add(int(rec.tmdb_id))
-        
+
         # Find most common genres
         genre_counts = {}
         for genre_id in all_genre_ids:
             genre_counts[genre_id] = genre_counts.get(genre_id, 0) + 1
-        
+
         # Get top genres for searching
         top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         primary_genres = [str(genre_id) for genre_id, _ in top_genres]
-        
-        # Search for recommendations
-        all_candidates = []
-        
-        # Discover movies by genre
-        discover_cache_key = ('discover_movie', ','.join(primary_genres))
-        discover_data = cache_get(discover_cache_key)
-        if discover_data is None:
-            discover_url = f"{TMDB_BASE_URL}/discover/movie"
-            params = {
+
+        # Gather candidates from two complementary sources, fetched in
+        # parallel since they're independent HTTP calls:
+        #  1. Genre-based discovery, OR'd across the user's top genres
+        #     (pipe-separated = OR; comma-separated = AND, which was
+        #     starving the candidate pool down to near-zero for less common
+        #     genre combinations).
+        #  2. TMDB's own "recommendations" endpoint for each movie the user
+        #     picked - a stronger relevance signal than genre overlap alone,
+        #     roughly TMDB's version of "people who liked this also liked".
+        discover_url = f"{TMDB_BASE_URL}/discover/movie"
+        genre_filter = '|'.join(primary_genres)
+        jobs = []
+        for page in range(1, 4):
+            jobs.append(('discover', None, discover_url, {
                 'api_key': TMDB_API_KEY,
-                'with_genres': ','.join(primary_genres),
+                'with_genres': genre_filter,
                 'sort_by': 'vote_average.desc',
                 'vote_count.gte': 100,
-                'page': 1
-            }
-            response = http.get(discover_url, params=params, timeout=10)
-            if response.ok:
-                discover_data = response.json()
-                cache_set(discover_cache_key, discover_data, ttl_seconds=900)
+                'page': page
+            }, ('discover_movie', genre_filter, page)))
+        for movie in user_movies:
+            movie_id = movie.get('id')
+            if movie_id:
+                jobs.append(('similar', movie_id, f"{TMDB_BASE_URL}/movie/{movie_id}/recommendations",
+                             {'api_key': TMDB_API_KEY}, ('movie_recs', movie_id)))
 
-        if discover_data:
-            all_candidates.extend(discover_data.get('results', []))
-        
+        all_candidates = []
+        similar_appearance_counts = {}
+
+        with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as executor:
+            futures = {
+                executor.submit(fetch_json_cached, url, params, cache_key): (kind, source_id)
+                for kind, source_id, url, params, cache_key in jobs
+            }
+            for future in futures:
+                kind, source_id = futures[future]
+                data = future.result()
+                if not data:
+                    continue
+                results = data.get('results', [])
+                all_candidates.extend(results)
+                if kind == 'similar':
+                    for candidate in results:
+                        candidate_id = candidate.get('id')
+                        if candidate_id:
+                            similar_appearance_counts[candidate_id] = similar_appearance_counts.get(candidate_id, 0) + 1
+
+        # De-duplicate; the two sources above frequently overlap, and without
+        # this the same movie could be scored (and weighted-selected) twice.
+        seen_ids = set()
+        unique_candidates = []
+        for candidate in all_candidates:
+            candidate_id = candidate.get('id')
+            if candidate_id and candidate_id not in seen_ids:
+                seen_ids.add(candidate_id)
+                unique_candidates.append(candidate)
+        all_candidates = unique_candidates
+
+        current_year = datetime.utcnow().year
+
         # Advanced movie scoring system
         scored_candidates = []
         
@@ -754,7 +842,6 @@ def get_movie_recommendation():
             if release_year:
                 try:
                     year = int(release_year)
-                    current_year = 2024
                     if current_year - year <= 2:
                         score += 8
                     elif current_year - year <= 5:
@@ -776,27 +863,39 @@ def get_movie_recommendation():
             # Language diversity bonus
             if movie.get('original_language', 'en') != 'en':
                 score += 7
-            
+
+            # Appears in TMDB's own "recommendations" for one or more of the
+            # user's input movies - a stronger signal than genre overlap.
+            score += min(similar_appearance_counts.get(movie.get('id'), 0), 4) * 10
+
             scored_candidates.append((movie, score))
-        
+
         if not scored_candidates:
             return jsonify({'error': 'No suitable recommendations found'}), 404
-        
-        # Weighted selection for variety
+
+        # Weighted selection for variety, biased toward the strongest matches
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        
+
         import random
-        top_count = min(12, len(scored_candidates))
+        top_count = min(5, len(scored_candidates))
         weights = [max(1, score) for _, score in scored_candidates[:top_count]]
         recommendation, score = random.choices(scored_candidates[:top_count], weights=weights)[0]
         
+        # Resolve genre names for the frontend (TMDB discover results only
+        # include genre_ids, not the {id, name} objects the UI needs to
+        # render genre badges).
+        recommendation['genres'] = [
+            {'id': genre_id, 'name': next((g['name'] for g in genre_mapping if g['id'] == genre_id), f'Genre {genre_id}')}
+            for genre_id in recommendation.get('genre_ids', [])
+        ]
+
         # Enhanced reasoning generation
         shared_genres = []
         for genre_id in recommendation.get('genre_ids', []):
             if genre_id in genre_counts:
                 genre_name = next((g['name'] for g in genre_mapping if g['id'] == genre_id), f'Genre {genre_id}')
                 shared_genres.append(genre_name)
-        
+
         reasoning_parts = []
         
         if shared_genres:
@@ -814,24 +913,25 @@ def get_movie_recommendation():
         if release_year:
             try:
                 year = int(release_year)
-                if year >= 2022:
+                if year >= current_year - 2:
                     reasoning_parts.append("A standout recent release.")
                 elif year <= 1990:
                     reasoning_parts.append("A cinematic masterpiece from film history.")
             except:
                 pass
-        
+
         if recommendation.get('original_language', 'en') != 'en':
             reasoning_parts.append("Expands your horizons with international cinema.")
-        
+
         reasoning = " ".join(reasoning_parts)
         recommendation['reasoning'] = reasoning
-        
+
         # Save to database
         try:
             db_recommendation = models.Recommendation(
                 user_id=user.id,
-                tmdb_id=recommendation.get('id'),
+                content_type='movie',
+                tmdb_id=str(recommendation.get('id')),
                 title=recommendation.get('title', ''),
                 release_date=recommendation.get('release_date', ''),
                 poster_path=recommendation.get('poster_path', ''),
@@ -881,43 +981,81 @@ def get_tv_recommendation():
             {'id': 37, 'name': 'Western'}
         ]
         
-        # Exclude previous recommendations for variety
-        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id).all()
+        # Exclude previous TV recommendations for variety. Scoped to
+        # content_type='tv' since movie/book recommendations share this table
+        # but use different id formats (book ids aren't numeric TMDB ids).
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='tv').all()
         for rec in previous_recommendations:
             excluded_ids.add(int(rec.tmdb_id))
-        
+
         # Find most common genres
         genre_counts = {}
         for genre_id in all_genre_ids:
             genre_counts[genre_id] = genre_counts.get(genre_id, 0) + 1
-        
+
         # Get top genres
         top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         primary_genres = [str(genre_id) for genre_id, _ in top_genres]
-        
-        # Search for recommendations
-        all_candidates = []
-        
-        # Discover TV series by genre
-        discover_cache_key = ('discover_tv', ','.join(primary_genres))
-        discover_data = cache_get(discover_cache_key)
-        if discover_data is None:
-            discover_url = f"{TMDB_BASE_URL}/discover/tv"
-            params = {
+
+        # Gather candidates from two complementary sources, fetched in
+        # parallel since they're independent HTTP calls:
+        #  1. Genre-based discovery, OR'd across the user's top genres
+        #     (pipe-separated = OR; comma-separated = AND, which was
+        #     starving the candidate pool down to near-zero for less common
+        #     genre combinations).
+        #  2. TMDB's own "recommendations" endpoint for each show the user
+        #     picked - a stronger relevance signal than genre overlap alone.
+        discover_url = f"{TMDB_BASE_URL}/discover/tv"
+        genre_filter = '|'.join(primary_genres)
+        jobs = []
+        for page in range(1, 4):
+            jobs.append(('discover', None, discover_url, {
                 'api_key': TMDB_API_KEY,
-                'with_genres': ','.join(primary_genres),
+                'with_genres': genre_filter,
                 'sort_by': 'vote_average.desc',
                 'vote_count.gte': 50,
-                'page': 1
-            }
-            response = http.get(discover_url, params=params, timeout=10)
-            if response.ok:
-                discover_data = response.json()
-                cache_set(discover_cache_key, discover_data, ttl_seconds=900)
+                'page': page
+            }, ('discover_tv', genre_filter, page)))
+        for tv_series in user_tv_series:
+            tv_id = tv_series.get('id')
+            if tv_id:
+                jobs.append(('similar', tv_id, f"{TMDB_BASE_URL}/tv/{tv_id}/recommendations",
+                             {'api_key': TMDB_API_KEY}, ('tv_recs', tv_id)))
 
-        if discover_data:
-            all_candidates.extend(discover_data.get('results', []))
-        
+        all_candidates = []
+        similar_appearance_counts = {}
+
+        with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as executor:
+            futures = {
+                executor.submit(fetch_json_cached, url, params, cache_key): (kind, source_id)
+                for kind, source_id, url, params, cache_key in jobs
+            }
+            for future in futures:
+                kind, source_id = futures[future]
+                data = future.result()
+                if not data:
+                    continue
+                results = data.get('results', [])
+                all_candidates.extend(results)
+                if kind == 'similar':
+                    for candidate in results:
+                        candidate_id = candidate.get('id')
+                        if candidate_id:
+                            similar_appearance_counts[candidate_id] = similar_appearance_counts.get(candidate_id, 0) + 1
+
+        # De-duplicate; the two sources above frequently overlap, and without
+        # this the same show could be scored (and weighted-selected) twice.
+        seen_ids = set()
+        unique_candidates = []
+        for candidate in all_candidates:
+            candidate_id = candidate.get('id')
+            if candidate_id and candidate_id not in seen_ids:
+                seen_ids.add(candidate_id)
+                unique_candidates.append(candidate)
+        all_candidates = unique_candidates
+
+        current_year = datetime.utcnow().year
+
         # Advanced TV series scoring system
         scored_candidates = []
         
@@ -962,7 +1100,6 @@ def get_tv_recommendation():
             if first_air_date:
                 try:
                     year = int(first_air_date[:4])
-                    current_year = 2024
                     if current_year - year <= 1:
                         score += 10
                     elif current_year - year <= 3:
@@ -985,27 +1122,39 @@ def get_tv_recommendation():
             origin_countries = tv_show.get('origin_country', [])
             if origin_countries and 'US' not in origin_countries:
                 score += 8
-            
+
+            # Appears in TMDB's own "recommendations" for one or more of the
+            # user's input shows - a stronger signal than genre overlap.
+            score += min(similar_appearance_counts.get(tv_show.get('id'), 0), 4) * 10
+
             scored_candidates.append((tv_show, score))
-        
+
         if not scored_candidates:
             return jsonify({'error': 'No suitable recommendations found'}), 404
-        
-        # Weighted random selection
+
+        # Weighted random selection, biased toward the strongest matches
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        
+
         import random
-        top_count = min(10, len(scored_candidates))
+        top_count = min(5, len(scored_candidates))
         weights = [max(1, score) for _, score in scored_candidates[:top_count]]
         recommendation, score = random.choices(scored_candidates[:top_count], weights=weights)[0]
         
+        # Resolve genre names for the frontend (TMDB discover results only
+        # include genre_ids, not the {id, name} objects the UI needs to
+        # render genre badges).
+        recommendation['genres'] = [
+            {'id': genre_id, 'name': next((g['name'] for g in tv_genre_mapping if g['id'] == genre_id), f'Genre {genre_id}')}
+            for genre_id in recommendation.get('genre_ids', [])
+        ]
+
         # Enhanced reasoning for TV series
         shared_genres = []
         for genre_id in recommendation.get('genre_ids', []):
             if genre_id in genre_counts:
                 genre_name = next((g['name'] for g in tv_genre_mapping if g['id'] == genre_id), f'Genre {genre_id}')
                 shared_genres.append(genre_name)
-        
+
         reasoning_parts = []
         
         if shared_genres:
@@ -1023,26 +1172,27 @@ def get_tv_recommendation():
         if air_year:
             try:
                 year = int(air_year)
-                if year >= 2023:
+                if year >= current_year - 1:
                     reasoning_parts.append("A compelling new series gaining critical acclaim.")
                 elif year <= 2000:
                     reasoning_parts.append("A groundbreaking series that defined television.")
             except:
                 pass
-        
+
         origin_countries = recommendation.get('origin_country', [])
         if origin_countries and 'US' not in origin_countries:
             country = origin_countries[0]
             reasoning_parts.append(f"Acclaimed international production from {country}.")
-        
+
         reasoning = " ".join(reasoning_parts)
         recommendation['reasoning'] = reasoning
-        
+
         # Save to database
         try:
             db_recommendation = models.Recommendation(
                 user_id=user.id,
-                tmdb_id=recommendation.get('id'),
+                content_type='tv',
+                tmdb_id=str(recommendation.get('id')),
                 title=recommendation.get('name', ''),
                 release_date=recommendation.get('first_air_date', ''),
                 poster_path=recommendation.get('poster_path', ''),
