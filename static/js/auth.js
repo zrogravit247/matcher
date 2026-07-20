@@ -17,6 +17,9 @@ class AuthWidget {
             this.me = await response.json();
 
             if (this.me.signed_in) {
+                // Signed in: chip in the navbar, and any standalone sign-in
+                // prompt on the page loses its purpose.
+                document.getElementById('footerSignInPrompt')?.classList.add('d-none');
                 this.renderUserChip();
             } else if (this.me.google_client_id) {
                 this.renderSignInButton();
@@ -29,6 +32,9 @@ class AuthWidget {
     renderSignInButton() {
         const buttonHost = document.createElement('div');
         this.container.appendChild(buttonHost);
+        // Pages may carry a second sign-in mount (e.g. the landing page's
+        // footer prompt); render the same button there too.
+        const footerHost = document.getElementById('footerSignIn');
 
         const script = document.createElement('script');
         script.src = 'https://accounts.google.com/gsi/client';
@@ -38,12 +44,16 @@ class AuthWidget {
                 client_id: this.me.google_client_id,
                 callback: (response) => this.handleCredential(response)
             });
-            google.accounts.id.renderButton(buttonHost, {
+            const style = {
                 theme: 'filled_black',
                 size: 'medium',
                 shape: 'pill',
                 text: 'signin_with'
-            });
+            };
+            google.accounts.id.renderButton(buttonHost, style);
+            if (footerHost) {
+                google.accounts.id.renderButton(footerHost, { ...style, size: 'large' });
+            }
         };
         document.head.appendChild(script);
     }
