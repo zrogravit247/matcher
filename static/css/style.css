@@ -1,27 +1,591 @@
+/* ==========================================================================
+   Matcher theme
+   A dark, poster-forward look inspired by film-cataloguing sites: deep
+   charcoal surfaces, muted blue-grey text, and colour used sparingly so the
+   artwork carries the page. Layered on top of stock Bootstrap, which supplies
+   the grid and component skeletons.
+   ========================================================================== */
+
+:root {
+    --bg: #14181c;
+    --bg-elevated: #1b2228;
+    --surface: #222c35;
+    --surface-hover: #2c3742;
+    --border: #2f3a45;
+
+    --text: #e9eef2;
+    --text-muted: #9ab;
+    --text-dim: #6b7a88;
+
+    --accent-green: #00e054;
+    --accent-blue: #40bcf4;
+    --accent-orange: #ff8000;
+
+    --radius: 4px;
+    --radius-lg: 8px;
+}
+
+body {
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+a {
+    color: var(--accent-blue);
+    text-decoration: none;
+}
+
+a:hover {
+    color: #6fcdf7;
+}
+
+.text-muted {
+    color: var(--text-muted) !important;
+}
+
+/* --------------------------------------------------------------------------
+   Navigation
+   -------------------------------------------------------------------------- */
+.matcher-navbar {
+    background: rgba(20, 24, 28, 0.92);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+    padding-top: 0.7rem;
+    padding-bottom: 0.7rem;
+}
+
+.matcher-navbar .navbar-brand {
+    color: var(--text);
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.matcher-navbar .navbar-brand:hover {
+    color: #fff;
+}
+
+.matcher-nav-link {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    transition: color 0.15s ease;
+}
+
+.matcher-nav-link:hover {
+    color: var(--text);
+}
+
+/* Google's rendered button lives in an iframe with its own baseline. */
+#authArea iframe {
+    vertical-align: middle;
+    color-scheme: light;
+}
+
+.matcher-user-name {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+/* --------------------------------------------------------------------------
+   Page header
+   -------------------------------------------------------------------------- */
+.matcher-hero h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+
+.matcher-hero .lead {
+    font-size: 1rem;
+    color: var(--text-muted);
+}
+
+/* Segmented control for Movies / TV / Books */
+.matcher-segment {
+    display: inline-flex;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px;
+    gap: 2px;
+}
+
+.matcher-segment a {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.45rem 1.1rem;
+    border-radius: 999px;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.matcher-segment a:hover {
+    color: var(--text);
+    background: var(--surface);
+}
+
+.matcher-segment a.active {
+    background: var(--surface-hover);
+    color: #fff;
+}
+
+/* Landing page category cards */
+.matcher-pick-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    height: 100%;
+    padding: 2.5rem 1.25rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    text-align: center;
+    transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.matcher-pick-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent-green);
+    background: var(--surface);
+}
+
+.matcher-pick-card i {
+    font-size: 1.75rem;
+    color: var(--accent-green);
+    margin-bottom: 0.5rem;
+}
+
+.matcher-pick-title {
+    color: var(--text);
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.matcher-pick-sub {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+}
+
+/* --------------------------------------------------------------------------
+   Cards & surfaces
+   -------------------------------------------------------------------------- */
+.card {
+    background-color: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+}
+
+.card-header {
+    background-color: transparent;
+    border-bottom: 1px solid var(--border);
+    padding: 1rem 1.25rem;
+}
+
+.card-header .card-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Forms
+   -------------------------------------------------------------------------- */
+.form-label {
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+}
+
+.form-control {
+    background-color: var(--surface);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 0.65rem 0.85rem;
+}
+
+.form-control:focus {
+    background-color: var(--surface);
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 3px rgba(64, 188, 244, 0.15);
+    color: var(--text);
+}
+
+.form-control::placeholder {
+    color: var(--text-dim);
+}
+
+/* --------------------------------------------------------------------------
+   Buttons
+   -------------------------------------------------------------------------- */
+.btn {
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.55rem 1.3rem;
+    white-space: nowrap;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.btn-lg {
+    padding: 0.75rem 2rem;
+    font-size: 0.9rem;
+}
+
+.btn-primary {
+    background-color: var(--accent-green);
+    border-color: var(--accent-green);
+    color: #14181c;
+}
+
+.btn-primary:hover,
+.btn-primary:focus {
+    background-color: #16ef6c;
+    border-color: #16ef6c;
+    color: #14181c;
+}
+
+.btn-primary:disabled {
+    background-color: var(--surface);
+    border-color: var(--surface);
+    color: var(--text-dim);
+}
+
+.btn-secondary,
+.btn-outline-secondary {
+    background-color: var(--surface);
+    border-color: var(--surface);
+    color: var(--text-muted);
+}
+
+.btn-secondary:hover,
+.btn-outline-secondary:hover {
+    background-color: var(--surface-hover);
+    border-color: var(--surface-hover);
+    color: var(--text);
+}
+
+.btn-info,
+.btn-outline-info {
+    background-color: transparent;
+    border-color: var(--border);
+    color: var(--accent-blue);
+}
+
+.btn-info:hover,
+.btn-outline-info:hover {
+    background-color: var(--surface);
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+}
+
+.btn-outline-success {
+    background-color: transparent;
+    border-color: var(--border);
+    color: var(--accent-green);
+}
+
+.btn-outline-success:hover,
+.btn-success {
+    background-color: rgba(0, 224, 84, 0.12);
+    border-color: var(--accent-green);
+    color: var(--accent-green);
+}
+
+.btn-outline-danger {
+    background-color: transparent;
+    border-color: var(--border);
+    color: #ff5c5c;
+}
+
+.btn-outline-danger:hover,
+.btn-danger {
+    background-color: rgba(255, 92, 92, 0.12);
+    border-color: #ff5c5c;
+    color: #ff5c5c;
+}
+
+.btn-outline-primary {
+    background-color: transparent;
+    border-color: var(--border);
+    color: var(--text-muted);
+}
+
+.btn-outline-primary:hover,
+.btn-outline-primary.active {
+    background-color: var(--surface);
+    border-color: var(--border);
+    color: var(--text);
+}
+
+/* --------------------------------------------------------------------------
+   Recommendation card
+   -------------------------------------------------------------------------- */
+.matcher-poster {
+    border-radius: var(--radius-lg);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    width: 100%;
+}
+
+.matcher-rec-title {
+    font-size: 1.9rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+}
+
+.matcher-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+.matcher-rating {
+    color: var(--accent-orange);
+    font-weight: 700;
+}
+
+.matcher-overview {
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
+/* Genre / category chips */
+.badge {
+    background-color: var(--surface) !important;
+    color: var(--text-muted) !important;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.35em 0.75em;
+}
+
+.badge.bg-warning {
+    background-color: rgba(255, 128, 0, 0.15) !important;
+    color: var(--accent-orange) !important;
+}
+
+/* "Why we recommend this" panel */
+.alert-info {
+    background-color: rgba(64, 188, 244, 0.07);
+    border: 1px solid rgba(64, 188, 244, 0.25);
+    border-radius: var(--radius-lg);
+    color: var(--text-muted);
+}
+
+.alert-info h6 {
+    color: var(--accent-blue);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.alert-danger {
+    background-color: rgba(255, 92, 92, 0.1);
+    border: 1px solid rgba(255, 92, 92, 0.3);
+    border-radius: var(--radius-lg);
+    color: #ff9c9c;
+}
+
+.alert-success {
+    background-color: rgba(0, 224, 84, 0.1);
+    border: 1px solid rgba(0, 224, 84, 0.3);
+    border-radius: var(--radius-lg);
+    color: var(--accent-green);
+}
+
+.matcher-action-label {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+/* --------------------------------------------------------------------------
+   Watchlist poster grid
+   -------------------------------------------------------------------------- */
+.matcher-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 1.25rem;
+}
+
+.matcher-tile {
+    position: relative;
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--surface);
+    aspect-ratio: 2 / 3;
+    border: 1px solid var(--border);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.matcher-tile:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent-blue);
+}
+
+.matcher-tile img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.matcher-tile-overlay {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.94) 0%, rgba(0, 0, 0, 0.75) 35%, rgba(0, 0, 0, 0) 75%);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    padding: 0.75rem;
+}
+
+.matcher-tile:hover .matcher-tile-overlay,
+.matcher-tile:focus-within .matcher-tile-overlay {
+    opacity: 1;
+}
+
+.matcher-tile-title {
+    color: #fff;
+    font-size: 0.85rem;
+    font-weight: 700;
+    line-height: 1.25;
+    margin-bottom: 0.15rem;
+}
+
+.matcher-tile-sub {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    margin-bottom: 0.5rem;
+}
+
+.matcher-tile-remove {
+    background: rgba(255, 92, 92, 0.9);
+    border: none;
+    border-radius: 999px;
+    color: #fff;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.3rem 0.6rem;
+    cursor: pointer;
+}
+
+.matcher-tile-remove:hover {
+    background: #ff5c5c;
+}
+
+.matcher-tile-badge {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    background: rgba(20, 24, 28, 0.85);
+    backdrop-filter: blur(4px);
+    border-radius: 999px;
+    color: var(--text-muted);
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.2rem 0.5rem;
+}
+
+.matcher-empty {
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-lg);
+    padding: 3.5rem 1.5rem;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Autocomplete suggestions
+   -------------------------------------------------------------------------- */
 .suggestions-dropdown {
     position: absolute;
     top: 100%;
     left: 0;
     right: 0;
-    background: var(--bs-dark);
-    border: 1px solid var(--bs-border-color);
-    border-radius: 0.375rem;
-    max-height: 200px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    max-height: 260px;
     overflow-y: auto;
     z-index: 1000;
-    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+    margin-top: 4px;
 }
 
 .suggestion-item {
     cursor: pointer;
-    transition: background-color 0.15s ease;
+    border-bottom: 1px solid var(--border) !important;
+    transition: background-color 0.12s ease;
+}
+
+.suggestion-item:last-child {
+    border-bottom: none !important;
 }
 
 .suggestion-item:hover {
-    background-color: var(--bs-primary) !important;
-    color: white;
+    background-color: var(--surface) !important;
 }
 
+.suggestion-poster {
+    border-radius: 3px;
+}
+
+.suggestions-dropdown::-webkit-scrollbar {
+    width: 8px;
+}
+
+.suggestions-dropdown::-webkit-scrollbar-track {
+    background: var(--bg-elevated);
+}
+
+.suggestions-dropdown::-webkit-scrollbar-thumb {
+    background: var(--surface-hover);
+    border-radius: 4px;
+}
+
+.suggestions-dropdown::-webkit-scrollbar-thumb:hover {
+    background: var(--text-dim);
+}
+
+/* --------------------------------------------------------------------------
+   Utilities
+   -------------------------------------------------------------------------- */
 .d-none {
     display: none !important;
 }
@@ -30,20 +594,26 @@
     position: relative !important;
 }
 
-/* Custom scrollbar for suggestions */
-.suggestions-dropdown::-webkit-scrollbar {
-    width: 6px;
+.spinner-border {
+    color: var(--accent-green) !important;
 }
 
-.suggestions-dropdown::-webkit-scrollbar-track {
-    background: var(--bs-gray-800);
-}
+@media (max-width: 575.98px) {
+    .matcher-hero h1 {
+        font-size: 1.5rem;
+    }
 
-.suggestions-dropdown::-webkit-scrollbar-thumb {
-    background: var(--bs-gray-600);
-    border-radius: 3px;
-}
+    .matcher-rec-title {
+        font-size: 1.4rem;
+    }
 
-.suggestions-dropdown::-webkit-scrollbar-thumb:hover {
-    background: var(--bs-gray-500);
+    .matcher-grid {
+        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+        gap: 0.85rem;
+    }
+
+    .matcher-segment a {
+        padding: 0.4rem 0.7rem;
+        font-size: 0.7rem;
+    }
 }

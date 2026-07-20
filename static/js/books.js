@@ -75,13 +75,11 @@ class BookRecommendationApp {
         this.hideAllSuggestions();
         
         try {
-            this.userBooks = [];
-            for (const title of bookTitles) {
-                const book = await this.searchBook(title);
-                if (book) {
-                    this.userBooks.push(book);
-                }
-            }
+            // Resolve all titles in parallel; sequential awaits here made the
+            // user wait for four round-trips before the recommendation even
+            // started.
+            const results = await Promise.all(bookTitles.map(title => this.searchBook(title)));
+            this.userBooks = results.filter(Boolean);
             
             if (this.userBooks.length < 3) {
                 const errorMsg = this.userBooks.length === 0 
@@ -150,7 +148,10 @@ class BookRecommendationApp {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ books: this.userBooks })
+                body: JSON.stringify({
+                    books: this.userBooks,
+                    feedback: FeedbackStore.all('book')
+                })
             });
             
             if (!response.ok) {
@@ -333,8 +334,10 @@ class BookRecommendationApp {
 
     async handleLikeFeedback(liked) {
         if (!this.currentRecommendation) return;
-        
+
         this.updateFeedbackButtons(liked);
+        // Record before fetching the next one so this like/dislike shapes it.
+        await FeedbackStore.record('book', this.currentRecommendation, liked);
         setTimeout(() => this.getAnotherRecommendation(), 1000);
     }
 
@@ -358,9 +361,39 @@ class BookRecommendationApp {
 
     async addToWatchlist() {
         if (!this.currentRecommendation) return;
-        
-        this.showSuccess('Added to reading list!');
-        this.addToWatchlistBtn.classList.add('d-none');
+
+        try {
+            const response = await fetch('/add_to_watchlist', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    content_type: 'book',
+                    id: this.currentRecommendation.id,
+                    title: this.currentRecommendation.title,
+                    release_date: this.currentRecommendation.published_date,
+                    poster_path: this.currentRecommendation.poster_path,
+                    overview: this.currentRecommendation.overview,
+                    vote_average: this.currentRecommendation.vote_average,
+                    genres: this.currentRecommendation.categories,
+                    authors: this.currentRecommendation.authors
+                })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                this.showSuccess('Added to reading list!');
+                this.addToWatchlistBtn.classList.add('d-none');
+            } else {
+                this.showError(data.error || 'Failed to add to reading list');
+            }
+
+        } catch (error) {
+            console.error('Error adding to reading list:', error);
+            this.showError('Failed to add to reading list');
+        }
     }
 
     resetApp() {

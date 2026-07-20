@@ -75,13 +75,11 @@ class MovieRecommendationApp {
         this.hideAllSuggestions();
         
         try {
-            this.userMovies = [];
-            for (const title of movieTitles) {
-                const movie = await this.searchMovie(title);
-                if (movie) {
-                    this.userMovies.push(movie);
-                }
-            }
+            // Resolve all titles in parallel; sequential awaits here made the
+            // user wait for four round-trips before the recommendation even
+            // started.
+            const results = await Promise.all(movieTitles.map(title => this.searchMovie(title)));
+            this.userMovies = results.filter(Boolean);
             
             if (this.userMovies.length < 3) {
                 const errorMsg = this.userMovies.length === 0 
@@ -140,7 +138,10 @@ class MovieRecommendationApp {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ movies: this.userMovies })
+                body: JSON.stringify({
+                    movies: this.userMovies,
+                    feedback: FeedbackStore.all('movie')
+                })
             });
             
             if (!response.ok) {
@@ -325,6 +326,8 @@ class MovieRecommendationApp {
         if (!this.currentRecommendation) return;
 
         this.updateFeedbackButtons(liked);
+        // Record before fetching the next one so this like/dislike shapes it.
+        await FeedbackStore.record('movie', this.currentRecommendation, liked);
         setTimeout(() => this.getAnotherRecommendation(), 1000);
     }
 
@@ -348,7 +351,7 @@ class MovieRecommendationApp {
 
     async addToWatchlist() {
         if (!this.currentRecommendation) return;
-        
+
         try {
             const response = await fetch('/add_to_watchlist', {
                 method: 'POST',
@@ -356,7 +359,8 @@ class MovieRecommendationApp {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    movie_id: this.currentRecommendation.id,
+                    content_type: 'movie',
+                    id: this.currentRecommendation.id,
                     title: this.currentRecommendation.title,
                     release_date: this.currentRecommendation.release_date,
                     poster_path: this.currentRecommendation.poster_path,
@@ -365,16 +369,16 @@ class MovieRecommendationApp {
                     genres: this.currentRecommendation.genres
                 })
             });
-            
+
             const data = await response.json();
-            
+
             if (response.ok) {
                 this.showSuccess('Added to watchlist!');
                 this.addToWatchlistBtn.classList.add('d-none');
             } else {
                 this.showError(data.error || 'Failed to add to watchlist');
             }
-            
+
         } catch (error) {
             console.error('Error adding to watchlist:', error);
             this.showError('Failed to add to watchlist');

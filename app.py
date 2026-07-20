@@ -12,17 +12,29 @@ import uuid
 class Base(DeclarativeBase):
     pass
 
-db = SQLAlchemy(model_class=Base)
+# expire_on_commit=False: by default SQLAlchemy marks every loaded object
+# stale after each commit, so the next attribute access silently re-SELECTs it.
+# With a remote database (Neon) that is a full network round-trip per request;
+# objects here never outlive one request, so the staleness guard buys nothing.
+db = SQLAlchemy(model_class=Base, session_options={"expire_on_commit": False})
 
 # create the app
 app = Flask(__name__)
 # setup a secret key, required by sessions
 app.secret_key = os.environ.get("SESSION_SECRET") or os.environ.get("FLASK_SECRET_KEY") or "dev-secret-key-change-in-production"
 # configure the database. Defaults to a local SQLite file so the app runs
-# with zero external dependencies; set DATABASE_URL to point at Postgres or
-# a mounted SQLite volume in production.
+# with zero external dependencies; set DATABASE_URL to point at Postgres
+# (e.g. Neon) in production.
 basedir = os.path.abspath(os.path.dirname(__file__))
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL") or f"sqlite:///{os.path.join(basedir, 'matcher.db')}"
+database_url = os.environ.get("DATABASE_URL") or f"sqlite:///{os.path.join(basedir, 'matcher.db')}"
+# Normalize Postgres URL schemes to the psycopg3 dialect: providers hand out
+# "postgres://" (legacy Heroku-style) or "postgresql://", both of which
+# SQLAlchemy would otherwise route to the unmaintained psycopg2 driver.
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_recycle": 300,
     "pool_pre_ping": True,
@@ -45,6 +57,14 @@ TMDB_BASE_URL = "https://api.themoviedb.org/3"
 # Google Books API configuration
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GOOGLE_BOOKS_BASE_URL = "https://www.googleapis.com/books/v1"
+
+# Google Sign-In (OAuth Client ID). Sign-in endpoints are disabled if unset;
+# the app still works fully for anonymous guests.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+
+# TV crew roles that indicate real authorship of a series. TMDB's tv_credits
+# rarely uses a literal "Creator" job, so the showrunner-ish roles stand in.
+TV_AUTHORSHIP_JOBS = {'Creator', 'Executive Producer', 'Writer', 'Director', 'Producer'}
 
 # Shared connection-pooled session for all outbound API calls (reuses TCP/TLS
 # connections instead of opening a new one per request).
@@ -96,17 +116,251 @@ def get_or_create_user():
     """Get or create a user based on session"""
     if 'user_id' not in session:
         session['user_id'] = str(uuid.uuid4())
-    
+
     # Try to find existing user by session ID
     user = models.User.query.filter_by(session_id=session['user_id']).first()
-    
+
     if not user:
         # Create new user
         user = models.User(session_id=session['user_id'])
         db.session.add(user)
         db.session.commit()
-    
+
     return user
+
+def merge_users(source, target):
+    """Move a guest user's data into a signed-in account, then delete the guest.
+
+    Used when someone who built up a watchlist/history anonymously signs in
+    to an account that already exists: nothing they did as a guest is lost.
+    Watchlist rows that would collide with an item already on the account
+    (same content_type + id) are dropped rather than duplicated.
+    """
+    existing_keys = {(item.content_type, item.tmdb_id) for item in target.watchlist}
+
+    # Drop guest rows that duplicate something already on the account.
+    for item in list(source.watchlist):
+        if (item.content_type, item.tmdb_id) in existing_keys:
+            db.session.delete(item)
+    db.session.flush()
+
+    # Re-parent the rest with bulk UPDATEs rather than by assigning to the ORM
+    # relationship: the guest's children cascade delete-orphan, so they must be
+    # detached at the SQL level and the stale in-memory collections expired
+    # before deleting the guest row - otherwise the cascade takes the
+    # re-parented rows down with it.
+    models.Watchlist.query.filter_by(user_id=source.id).update({'user_id': target.id})
+    models.Recommendation.query.filter_by(user_id=source.id).update({'user_id': target.id})
+    db.session.flush()
+    db.session.expire(source)
+
+    db.session.delete(source)
+    db.session.commit()
+
+def build_taste_profile(user, content_type, local_feedback=None, history=None):
+    """Combine a user's like/dislike history into signals the scorers can use.
+
+    Signed-in users' feedback lives in the database; guests' feedback lives in
+    their browser's localStorage and arrives with the request (we never store
+    it server-side). Both are merged here so scoring works the same either way.
+
+    `history` is the user's prefetched Recommendation rows for this content
+    type; the recommendation routes already load them for exclusions, and
+    passing them in avoids a second round-trip to the remote database.
+
+    Returns liked/disliked genre weights plus the ids of liked titles, which
+    callers use to pull "more like this" candidates.
+    """
+    entries = []
+
+    if user.google_id:
+        if history is not None:
+            rows = sorted((r for r in history if r.was_liked is not None),
+                          key=lambda r: r.recommended_at, reverse=True)[:30]
+        else:
+            rows = (models.Recommendation.query
+                    .filter(models.Recommendation.user_id == user.id,
+                            models.Recommendation.content_type == content_type,
+                            models.Recommendation.was_liked.isnot(None))
+                    .order_by(models.Recommendation.recommended_at.desc())
+                    .limit(30).all())
+        for row in rows:
+            entries.append({
+                'id': row.tmdb_id,
+                'liked': row.was_liked,
+                'genre_ids': row.genres if isinstance(row.genres, list) else []
+            })
+
+    for entry in (local_feedback or [])[-30:]:
+        if not isinstance(entry, dict) or entry.get('liked') is None:
+            continue
+        entries.append({
+            'id': str(entry.get('id', '')),
+            'liked': bool(entry.get('liked')),
+            'genre_ids': entry.get('genre_ids') or []
+        })
+
+    liked_genres = {}
+    disliked_genres = {}
+    liked_ids = []
+    for entry in entries:
+        bucket = liked_genres if entry['liked'] else disliked_genres
+        for genre_id in entry['genre_ids']:
+            # Book "genres" are category strings; movie/TV are numeric ids.
+            bucket[genre_id] = bucket.get(genre_id, 0) + 1
+        if entry['liked'] and entry['id']:
+            liked_ids.append(entry['id'])
+
+    return {
+        'liked_genres': liked_genres,
+        'disliked_genres': disliked_genres,
+        'liked_ids': liked_ids
+    }
+
+def score_feedback_adjustment(item_genre_ids, profile):
+    """Genre-level score delta from a user's likes/dislikes.
+
+    Positive signals outweigh negative ones so a single dislike can't wipe out
+    a genre the user has repeatedly liked.
+    """
+    delta = 0
+    for genre_id in item_genre_ids:
+        delta += 12 * min(profile['liked_genres'].get(genre_id, 0), 3)
+        delta -= 8 * min(profile['disliked_genres'].get(genre_id, 0), 3)
+    return delta
+
+@app.route('/api/recommendation_feedback', methods=['POST'])
+def recommendation_feedback():
+    """Record a like/dislike. Only persisted for signed-in users; guests keep
+    their feedback in localStorage and send it with each request instead."""
+    try:
+        data = request.get_json() or {}
+        item_id = data.get('id')
+        liked = data.get('liked')
+        content_type = data.get('content_type', 'movie')
+
+        if item_id is None or liked is None:
+            return jsonify({'error': 'id and liked are required'}), 400
+
+        user = get_or_create_user()
+        if not user.google_id:
+            # Guest: acknowledged, but intentionally not stored server-side.
+            return jsonify({'success': True, 'stored': False})
+
+        rec = (models.Recommendation.query
+               .filter_by(user_id=user.id, content_type=content_type, tmdb_id=str(item_id))
+               .order_by(models.Recommendation.recommended_at.desc())
+               .first())
+        if not rec:
+            return jsonify({'error': 'Recommendation not found'}), 404
+
+        rec.was_liked = bool(liked)
+        db.session.commit()
+        return jsonify({'success': True, 'stored': True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Failed to record feedback: {str(e)}'}), 500
+
+@app.route('/api/sync_feedback', methods=['POST'])
+def sync_feedback():
+    """Merge a guest's localStorage feedback into their account after sign-in."""
+    try:
+        user = get_or_create_user()
+        if not user.google_id:
+            return jsonify({'success': False, 'error': 'Not signed in'}), 401
+
+        data = request.get_json() or {}
+        entries = data.get('feedback') or []
+        applied = 0
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get('liked') is None:
+                continue
+            rec = (models.Recommendation.query
+                   .filter_by(user_id=user.id,
+                              content_type=entry.get('content_type', 'movie'),
+                              tmdb_id=str(entry.get('id', '')))
+                   .order_by(models.Recommendation.recommended_at.desc())
+                   .first())
+            if rec and rec.was_liked is None:
+                rec.was_liked = bool(entry['liked'])
+                applied += 1
+        db.session.commit()
+        return jsonify({'success': True, 'applied': applied})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Failed to sync feedback: {str(e)}'}), 500
+
+@app.route('/api/me')
+def api_me():
+    """Current session's identity, plus the OAuth client id the frontend
+    needs to render the Google Sign-In button."""
+    try:
+        user = get_or_create_user()
+        return jsonify({
+            'signed_in': bool(user.google_id),
+            'name': user.display_name,
+            'email': user.email,
+            'avatar_url': user.avatar_url,
+            'google_client_id': GOOGLE_CLIENT_ID
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to load profile: {str(e)}'}), 500
+
+@app.route('/auth/google', methods=['POST'])
+def auth_google():
+    """Verify a Google ID token and sign the session in, merging any guest data."""
+    if not GOOGLE_CLIENT_ID:
+        return jsonify({'error': 'Google Sign-In is not configured'}), 503
+
+    data = request.get_json()
+    credential = data.get('credential') if data else None
+    if not credential:
+        return jsonify({'error': 'Missing credential'}), 400
+
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_auth_requests
+        idinfo = google_id_token.verify_oauth2_token(
+            credential, google_auth_requests.Request(), GOOGLE_CLIENT_ID)
+    except ValueError:
+        return jsonify({'error': 'Invalid credential'}), 401
+
+    try:
+        google_id = idinfo['sub']
+        current = get_or_create_user()
+        account = models.User.query.filter_by(google_id=google_id).first()
+
+        if account is None:
+            # First sign-in for this Google account: promote the current
+            # session user (and everything they saved as a guest) in place.
+            current.google_id = google_id
+            account = current
+        elif account.id != current.id:
+            # Existing account: fold the guest session's data into it and
+            # point this session at the account.
+            merge_users(current, account)
+            session['user_id'] = account.session_id
+
+        account.email = idinfo.get('email')
+        account.display_name = idinfo.get('name')
+        account.avatar_url = idinfo.get('picture')
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'name': account.display_name,
+            'email': account.email,
+            'avatar_url': account.avatar_url
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Sign-in failed: {str(e)}'}), 500
+
+@app.route('/auth/logout', methods=['POST'])
+def auth_logout():
+    """Sign out: detach the session. The next request gets a fresh guest identity."""
+    session.pop('user_id', None)
+    return jsonify({'success': True})
 
 @app.route('/')
 def index():
@@ -130,48 +384,52 @@ def watchlist_page():
 
 @app.route('/api/watchlist')
 def get_watchlist():
-    """Get user's watchlist"""
+    """Get user's full watchlist across all content types"""
     try:
         user = get_or_create_user()
         watchlist_items = models.Watchlist.query.filter_by(user_id=user.id).order_by(models.Watchlist.added_at.desc()).all()
-        
+
         watchlist = []
         for item in watchlist_items:
             watchlist.append({
                 'tmdb_id': item.tmdb_id,
+                'content_type': item.content_type,
                 'title': item.title,
                 'release_date': item.release_date,
                 'poster_path': item.poster_path,
                 'overview': item.overview,
                 'vote_average': item.vote_average,
                 'genres': item.genres,
+                'authors': item.authors,
                 'added_at': item.added_at.isoformat()
             })
-        
+
         return jsonify({'watchlist': watchlist})
     except Exception as e:
         return jsonify({'error': f'Failed to get watchlist: {str(e)}'}), 500
 
 @app.route('/api/remove-from-watchlist', methods=['POST'])
 def remove_from_watchlist():
-    """Remove movie from watchlist"""
+    """Remove an item from the watchlist"""
     try:
         data = request.get_json()
-        movie_id = data.get('movie_id')
-        
-        if not movie_id:
-            return jsonify({'error': 'Movie ID is required'}), 400
-        
+        item_id = data.get('id') or data.get('movie_id')
+        content_type = data.get('content_type', 'movie')
+
+        if not item_id:
+            return jsonify({'error': 'Item ID is required'}), 400
+
         user = get_or_create_user()
-        watchlist_item = models.Watchlist.query.filter_by(user_id=user.id, tmdb_id=movie_id).first()
-        
+        watchlist_item = models.Watchlist.query.filter_by(
+            user_id=user.id, content_type=content_type, tmdb_id=str(item_id)).first()
+
         if not watchlist_item:
-            return jsonify({'error': 'Movie not found in watchlist'}), 404
-        
+            return jsonify({'error': 'Item not found in watchlist'}), 404
+
         db.session.delete(watchlist_item)
         db.session.commit()
-        
-        return jsonify({'success': True, 'message': 'Movie removed from watchlist'})
+
+        return jsonify({'success': True, 'message': 'Removed from watchlist'})
     except Exception as e:
         return jsonify({'error': f'Failed to remove from watchlist: {str(e)}'}), 500
 
@@ -189,16 +447,19 @@ def download_watchlist_csv():
         writer = csv.writer(output)
         
         # Write header
-        writer.writerow(['Title', 'Release Date', 'Rating', 'Added Date', 'Overview'])
-        
+        writer.writerow(['Type', 'Title', 'Authors', 'Release Date', 'Rating', 'Added Date', 'Overview'])
+
         # Write data
         for item in watchlist_items:
+            overview = item.overview or ''
             writer.writerow([
+                item.content_type,
                 item.title,
+                ', '.join(item.authors) if item.authors else '',
                 item.release_date,
                 item.vote_average,
                 item.added_at.strftime('%Y-%m-%d'),
-                item.overview[:100] + '...' if len(item.overview) > 100 else item.overview
+                overview[:100] + '...' if len(overview) > 100 else overview
             ])
         
         output.seek(0)
@@ -212,59 +473,45 @@ def download_watchlist_csv():
     except Exception as e:
         return jsonify({'error': f'Failed to download CSV: {str(e)}'}), 500
 
-@app.route('/api/reading-list')
-def get_reading_list():
-    """Get user's reading list (placeholder for now)"""
-    try:
-        # For now, return empty list since we don't have book watchlist implemented yet
-        # This can be extended to support books in the future
-        return jsonify({'books': []})
-    except Exception as e:
-        return jsonify({'error': f'Failed to get reading list: {str(e)}'}), 500
-
-@app.route('/api/remove-from-reading-list', methods=['POST'])
-def remove_from_reading_list():
-    """Remove book from reading list (placeholder for now)"""
-    try:
-        return jsonify({'success': True, 'message': 'Book removed from reading list'})
-    except Exception as e:
-        return jsonify({'error': f'Failed to remove from reading list: {str(e)}'}), 500
-
 @app.route('/add_to_watchlist', methods=['POST'])
 def add_to_watchlist():
-    """Add movie to user's watchlist"""
+    """Add a movie, TV show, or book to the user's watchlist"""
     try:
         data = request.get_json()
-        movie_id = data.get('movie_id')
+        item_id = data.get('id') or data.get('movie_id')
         title = data.get('title')
-        
-        if not movie_id or not title:
-            return jsonify({'error': 'Movie ID and title are required'}), 400
-        
+        content_type = data.get('content_type', 'movie')
+
+        if content_type not in ('movie', 'tv', 'book'):
+            return jsonify({'error': 'Invalid content type'}), 400
+        if not item_id or not title:
+            return jsonify({'error': 'Item ID and title are required'}), 400
+
         user = get_or_create_user()
-        
-        # Check if movie already in watchlist
-        existing = models.Watchlist.query.filter_by(user_id=user.id, tmdb_id=movie_id).first()
+
+        existing = models.Watchlist.query.filter_by(
+            user_id=user.id, content_type=content_type, tmdb_id=str(item_id)).first()
         if existing:
-            return jsonify({'error': 'Movie already in watchlist'}), 400
-        
-        # Add to watchlist
+            return jsonify({'error': 'Already in watchlist'}), 400
+
         watchlist_item = models.Watchlist(
             user_id=user.id,
-            tmdb_id=movie_id,
+            content_type=content_type,
+            tmdb_id=str(item_id),
             title=title,
             release_date=data.get('release_date', ''),
             poster_path=data.get('poster_path', ''),
             overview=data.get('overview', ''),
             vote_average=data.get('vote_average', 0),
-            genres=data.get('genres', [])
+            genres=data.get('genres', []),
+            authors=data.get('authors', [])
         )
-        
+
         db.session.add(watchlist_item)
         db.session.commit()
-        
-        return jsonify({'success': True, 'message': 'Movie added to watchlist'})
-        
+
+        return jsonify({'success': True, 'message': 'Added to watchlist'})
+
     except Exception as e:
         return jsonify({'error': f'Failed to add to watchlist: {str(e)}'}), 500
 
@@ -371,7 +618,7 @@ def get_movie_suggestions():
                 'id': movie['id'],
                 'title': movie['title'],
                 'release_date': movie.get('release_date', ''),
-                'poster_path': f"https://image.tmdb.org/t/p/w200{movie['poster_path']}" if movie.get('poster_path') else '',
+                'poster_path': f"https://image.tmdb.org/t/p/w92{movie['poster_path']}" if movie.get('poster_path') else '',
                 'vote_average': movie.get('vote_average', 0),
                 'genre_ids': movie.get('genre_ids', [])
             })
@@ -407,7 +654,7 @@ def get_tv_suggestions():
                 'id': tv['id'],
                 'name': tv['name'],
                 'first_air_date': tv.get('first_air_date', ''),
-                'poster_path': f"https://image.tmdb.org/t/p/w200{tv['poster_path']}" if tv.get('poster_path') else '',
+                'poster_path': f"https://image.tmdb.org/t/p/w92{tv['poster_path']}" if tv.get('poster_path') else '',
                 'vote_average': tv.get('vote_average', 0),
                 'genre_ids': tv.get('genre_ids', [])
             })
@@ -502,9 +749,13 @@ def get_book_recommendation():
         
         if not user_books or len(user_books) < 3:
             return jsonify({'error': 'Please provide at least 3 books'}), 400
-        
+
         user = get_or_create_user()
-        
+        # One query serves both the exclusion list and the taste profile;
+        # every extra query is a network round-trip to the remote database.
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='book').all()
+        profile = build_taste_profile(user, 'book', data.get('feedback'), history=previous_recommendations)
+
         # Analyze user preferences
         user_categories = []
         user_authors = []
@@ -518,7 +769,6 @@ def get_book_recommendation():
         # Exclude previous book recommendations for variety. Scoped to
         # content_type='book' since movie/tv recommendations share this table
         # but use numeric TMDB ids rather than Google Books ids.
-        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='book').all()
         for rec in previous_recommendations:
             excluded_ids.add(rec.tmdb_id)
 
@@ -579,12 +829,13 @@ def get_book_recommendation():
                     category_matches += 1
                     score += max(15 - (category_matches * 3), 5) * category_counts[category]
             
-            # Author match: a book by an author the user already likes is a
-            # high-precision recommendation (and is now deliberately fetched
-            # via the inauthor: search above), so it shouldn't score below
-            # diversity picks - just slightly, to leave room for discovery.
-            if any(author in user_authors for author in book_authors):
-                score += 10
+            # Author match, weighted by how many of the user's picks that
+            # author wrote - the book equivalent of the director/creator
+            # signal. Four books by one author is a deliberate request for
+            # more of them; one is only a mild hint.
+            author_affinity = max((author_counts.get(author, 0) for author in book_authors), default=0)
+            if author_affinity:
+                score += min(author_affinity, 4) * 12
             else:
                 score += 6
             
@@ -623,7 +874,11 @@ def get_book_recommendation():
             # Language diversity
             if book.get('language', 'en') != 'en':
                 score += 5
-            
+
+            # Steer toward categories the user has liked and away from ones
+            # they have rejected.
+            score += score_feedback_adjustment(book_categories, profile)
+
             if score > 0:
                 scored_candidates.append((book, score))
         
@@ -644,11 +899,18 @@ def get_book_recommendation():
             shared_authors = [author for author in recommendation.get('authors', []) if author in user_authors]
             
             reasoning_parts = []
-            
-            if shared_categories:
+
+            # Lead with the author when the pick is by one the user favours -
+            # the most specific reason available, same as director for films.
+            if shared_authors:
+                author = shared_authors[0]
+                picked = author_counts.get(author, 0)
+                if picked > 1:
+                    reasoning_parts.append(f"Another book from {author}, who wrote {picked} of your picks.")
+                else:
+                    reasoning_parts.append(f"Another book from {author}, whose work you already picked.")
+            elif shared_categories:
                 reasoning_parts.append(f"Perfect match for your {', '.join(shared_categories[:2]).lower()} interests from {', '.join([book.get('title', '') for book in user_books[:2]])}.")
-            elif shared_authors:
-                reasoning_parts.append(f"Since you enjoyed {shared_authors[0]}, this explores similar storytelling mastery.")
             else:
                 reasoning_parts.append(f"Thematically connected to your taste for {', '.join([book.get('title', '') for book in user_books[:2]])}.")
             
@@ -701,17 +963,21 @@ def get_movie_recommendation():
     try:
         data = request.get_json()
         user_movies = data.get('movies', [])
-        
+
         if not user_movies or len(user_movies) < 3:
             return jsonify({'error': 'Please provide at least 3 movies'}), 400
-        
+
         user = get_or_create_user()
-        
+        # One query serves both the exclusion list and the taste profile;
+        # every extra query is a network round-trip to the remote database.
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='movie').all()
+        profile = build_taste_profile(user, 'movie', data.get('feedback'), history=previous_recommendations)
+
         # Enhanced preference analysis
         all_genre_ids = []
         excluded_ids = set()
         user_ratings = []
-        
+
         for movie in user_movies:
             all_genre_ids.extend(movie.get('genre_ids', []))
             excluded_ids.add(movie.get('id'))
@@ -731,7 +997,6 @@ def get_movie_recommendation():
         # Exclude previous movie recommendations for variety. Scoped to
         # content_type='movie' since tv/book recommendations share this table
         # but use different id formats (book ids aren't numeric TMDB ids).
-        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='movie').all()
         for rec in previous_recommendations:
             excluded_ids.add(int(rec.tmdb_id))
 
@@ -744,7 +1009,31 @@ def get_movie_recommendation():
         top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         primary_genres = [str(genre_id) for genre_id, _ in top_genres]
 
-        # Gather candidates from two complementary sources, fetched in
+        # Who directed the user's picks? Done first (and in parallel) because
+        # the director ids feed the candidate search below.
+        director_counts = {}
+        director_names = {}
+        credit_jobs = [(movie.get('id'), f"{TMDB_BASE_URL}/movie/{movie.get('id')}/credits",
+                        {'api_key': TMDB_API_KEY}, ('movie_credits', movie.get('id')))
+                       for movie in user_movies if movie.get('id')]
+        if credit_jobs:
+            with ThreadPoolExecutor(max_workers=len(credit_jobs)) as executor:
+                futures = [executor.submit(fetch_json_cached, url, params, cache_key)
+                           for _, url, params, cache_key in credit_jobs]
+                for future in futures:
+                    data = future.result()
+                    if not data:
+                        continue
+                    for crew in data.get('crew', []):
+                        if crew.get('job') == 'Director' and crew.get('id'):
+                            director_counts[crew['id']] = director_counts.get(crew['id'], 0) + 1
+                            director_names[crew['id']] = crew.get('name', '')
+
+        # Directors the user picked more than once are a deliberate signal
+        # (e.g. four Nolan films), so pull their filmographies in as candidates.
+        top_directors = sorted(director_counts.items(), key=lambda x: x[1], reverse=True)[:2]
+
+        # Gather candidates from three complementary sources, fetched in
         # parallel since they're independent HTTP calls:
         #  1. Genre-based discovery, OR'd across the user's top genres
         #     (pipe-separated = OR; comma-separated = AND, which was
@@ -753,6 +1042,7 @@ def get_movie_recommendation():
         #  2. TMDB's own "recommendations" endpoint for each movie the user
         #     picked - a stronger relevance signal than genre overlap alone,
         #     roughly TMDB's version of "people who liked this also liked".
+        #  3. Other films by the directors behind the user's picks.
         discover_url = f"{TMDB_BASE_URL}/discover/movie"
         genre_filter = '|'.join(primary_genres)
         jobs = []
@@ -769,9 +1059,21 @@ def get_movie_recommendation():
             if movie_id:
                 jobs.append(('similar', movie_id, f"{TMDB_BASE_URL}/movie/{movie_id}/recommendations",
                              {'api_key': TMDB_API_KEY}, ('movie_recs', movie_id)))
+        # Titles the user hit "Love It!" on pull in their own similar-titles
+        # list, so a like visibly steers the very next recommendation.
+        for liked_id in profile['liked_ids'][:4]:
+            jobs.append(('similar', liked_id, f"{TMDB_BASE_URL}/movie/{liked_id}/recommendations",
+                         {'api_key': TMDB_API_KEY}, ('movie_recs', liked_id)))
+        for director_id, _ in top_directors:
+            # Person credits rather than discover's with_crew filter: with_crew
+            # matches any crew role, so a film the director merely produced
+            # would be surfaced and then described as one they directed.
+            jobs.append(('director', director_id, f"{TMDB_BASE_URL}/person/{director_id}/movie_credits",
+                         {'api_key': TMDB_API_KEY}, ('director_films', director_id)))
 
         all_candidates = []
         similar_appearance_counts = {}
+        candidate_directors = {}
 
         with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as executor:
             futures = {
@@ -782,6 +1084,17 @@ def get_movie_recommendation():
                 kind, source_id = futures[future]
                 data = future.result()
                 if not data:
+                    continue
+                if kind == 'director':
+                    # Person credits are shaped differently to discover results:
+                    # crew entries across every role, no 'results' key, and
+                    # unfiltered for quality. Keep only films they actually
+                    # directed, so the reasoning line stays truthful.
+                    for candidate in data.get('crew', []):
+                        if (candidate.get('job') == 'Director' and candidate.get('id')
+                                and candidate.get('vote_count', 0) >= 100):
+                            all_candidates.append(candidate)
+                            candidate_directors[candidate['id']] = source_id
                     continue
                 results = data.get('results', [])
                 all_candidates.extend(results)
@@ -868,6 +1181,17 @@ def get_movie_recommendation():
             # user's input movies - a stronger signal than genre overlap.
             score += min(similar_appearance_counts.get(movie.get('id'), 0), 4) * 10
 
+            # Steer toward genres the user has liked and away from ones they
+            # have rejected.
+            score += score_feedback_adjustment(movie_genres, profile)
+
+            # Same director as the user's picks, weighted by how many of their
+            # picks that director made: someone who chose four Nolan films is
+            # asking for Nolan far more strongly than someone who chose one.
+            candidate_director = candidate_directors.get(movie.get('id'))
+            if candidate_director:
+                score += min(director_counts.get(candidate_director, 0), 4) * 25
+
             scored_candidates.append((movie, score))
 
         if not scored_candidates:
@@ -897,12 +1221,20 @@ def get_movie_recommendation():
                 shared_genres.append(genre_name)
 
         reasoning_parts = []
-        
-        if shared_genres:
+
+        # Lead with the director when the pick is by one the user clearly
+        # favours - it's the most specific reason we have.
+        rec_director = candidate_directors.get(recommendation.get('id'))
+        rec_director_name = director_names.get(rec_director) if rec_director else None
+        if rec_director_name and director_counts.get(rec_director, 0) > 1:
+            reasoning_parts.append(f"Another film from {rec_director_name}, who directed {director_counts[rec_director]} of your picks.")
+        elif rec_director_name:
+            reasoning_parts.append(f"Directed by {rec_director_name}, whose work you already picked.")
+        elif shared_genres:
             reasoning_parts.append(f"Perfect match for your {', '.join(shared_genres[:2]).lower()} preferences from films like {user_movies[0].get('title', '')}.")
         else:
             reasoning_parts.append(f"Cinematically connected to your appreciation for {user_movies[0].get('title', '')} and {user_movies[1].get('title', '')}.")
-        
+
         # Add unique characteristics
         rating = recommendation.get('vote_average', 0)
         release_year = recommendation.get('release_date', '')[:4]
@@ -958,9 +1290,13 @@ def get_tv_recommendation():
         
         if not user_tv_series or len(user_tv_series) < 3:
             return jsonify({'error': 'Please provide at least 3 TV series'}), 400
-        
+
         user = get_or_create_user()
-        
+        # One query serves both the exclusion list and the taste profile;
+        # every extra query is a network round-trip to the remote database.
+        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='tv').all()
+        profile = build_taste_profile(user, 'tv', data.get('feedback'), history=previous_recommendations)
+
         # Enhanced TV preference analysis
         all_genre_ids = []
         excluded_ids = set()
@@ -984,7 +1320,6 @@ def get_tv_recommendation():
         # Exclude previous TV recommendations for variety. Scoped to
         # content_type='tv' since movie/book recommendations share this table
         # but use different id formats (book ids aren't numeric TMDB ids).
-        previous_recommendations = models.Recommendation.query.filter_by(user_id=user.id, content_type='tv').all()
         for rec in previous_recommendations:
             excluded_ids.add(int(rec.tmdb_id))
 
@@ -997,7 +1332,30 @@ def get_tv_recommendation():
         top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         primary_genres = [str(genre_id) for genre_id, _ in top_genres]
 
-        # Gather candidates from two complementary sources, fetched in
+        # Who created the user's picks? For TV the creator is the meaningful
+        # authorship signal - directors rotate episode to episode, so "created
+        # by Vince Gilligan" says far more than who directed one episode.
+        creator_counts = {}
+        creator_names = {}
+        detail_jobs = [(show.get('id'), f"{TMDB_BASE_URL}/tv/{show.get('id')}",
+                        {'api_key': TMDB_API_KEY}, ('tv_details', show.get('id')))
+                       for show in user_tv_series if show.get('id')]
+        if detail_jobs:
+            with ThreadPoolExecutor(max_workers=len(detail_jobs)) as executor:
+                futures = [executor.submit(fetch_json_cached, url, params, cache_key)
+                           for _, url, params, cache_key in detail_jobs]
+                for future in futures:
+                    data = future.result()
+                    if not data:
+                        continue
+                    for creator in data.get('created_by', []):
+                        if creator.get('id'):
+                            creator_counts[creator['id']] = creator_counts.get(creator['id'], 0) + 1
+                            creator_names[creator['id']] = creator.get('name', '')
+
+        top_creators = sorted(creator_counts.items(), key=lambda x: x[1], reverse=True)[:2]
+
+        # Gather candidates from three complementary sources, fetched in
         # parallel since they're independent HTTP calls:
         #  1. Genre-based discovery, OR'd across the user's top genres
         #     (pipe-separated = OR; comma-separated = AND, which was
@@ -1005,6 +1363,10 @@ def get_tv_recommendation():
         #     genre combinations).
         #  2. TMDB's own "recommendations" endpoint for each show the user
         #     picked - a stronger relevance signal than genre overlap alone.
+        #  3. Other shows from the creators behind the user's picks. This uses
+        #     the person credits endpoint rather than discover's with_people
+        #     filter, which does not actually constrain TV results (it returns
+        #     thousands of unrelated shows).
         discover_url = f"{TMDB_BASE_URL}/discover/tv"
         genre_filter = '|'.join(primary_genres)
         jobs = []
@@ -1021,9 +1383,18 @@ def get_tv_recommendation():
             if tv_id:
                 jobs.append(('similar', tv_id, f"{TMDB_BASE_URL}/tv/{tv_id}/recommendations",
                              {'api_key': TMDB_API_KEY}, ('tv_recs', tv_id)))
+        # Shows the user hit "Love It!" on pull in their own similar-shows
+        # list, so a like visibly steers the very next recommendation.
+        for liked_id in profile['liked_ids'][:4]:
+            jobs.append(('similar', liked_id, f"{TMDB_BASE_URL}/tv/{liked_id}/recommendations",
+                         {'api_key': TMDB_API_KEY}, ('tv_recs', liked_id)))
+        for creator_id, _ in top_creators:
+            jobs.append(('creator', creator_id, f"{TMDB_BASE_URL}/person/{creator_id}/tv_credits",
+                         {'api_key': TMDB_API_KEY}, ('tv_person_credits', creator_id)))
 
         all_candidates = []
         similar_appearance_counts = {}
+        candidate_creators = {}
 
         with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as executor:
             futures = {
@@ -1034,6 +1405,18 @@ def get_tv_recommendation():
                 kind, source_id = futures[future]
                 data = future.result()
                 if not data:
+                    continue
+                if kind == 'creator':
+                    # Person credits are shaped differently to discover results:
+                    # crew entries across every role, no 'results' key, and
+                    # unfiltered for quality. Restrict to substantive creative
+                    # roles so incidental credits ("Thanks") don't count as
+                    # authorship.
+                    for candidate in data.get('crew', []):
+                        if (candidate.get('job') in TV_AUTHORSHIP_JOBS and candidate.get('id')
+                                and candidate.get('vote_count', 0) >= 50):
+                            all_candidates.append(candidate)
+                            candidate_creators[candidate['id']] = source_id
                     continue
                 results = data.get('results', [])
                 all_candidates.extend(results)
@@ -1127,6 +1510,16 @@ def get_tv_recommendation():
             # user's input shows - a stronger signal than genre overlap.
             score += min(similar_appearance_counts.get(tv_show.get('id'), 0), 4) * 10
 
+            # Steer toward genres the user has liked and away from ones they
+            # have rejected.
+            score += score_feedback_adjustment(tv_genres, profile)
+
+            # Same creator as the user's picks, weighted by how many of their
+            # picks that person created.
+            candidate_creator = candidate_creators.get(tv_show.get('id'))
+            if candidate_creator:
+                score += min(creator_counts.get(candidate_creator, 0), 4) * 25
+
             scored_candidates.append((tv_show, score))
 
         if not scored_candidates:
@@ -1156,12 +1549,19 @@ def get_tv_recommendation():
                 shared_genres.append(genre_name)
 
         reasoning_parts = []
-        
-        if shared_genres:
+
+        # Lead with the creator when the pick comes from one the user favours.
+        rec_creator = candidate_creators.get(recommendation.get('id'))
+        rec_creator_name = creator_names.get(rec_creator) if rec_creator else None
+        if rec_creator_name and creator_counts.get(rec_creator, 0) > 1:
+            reasoning_parts.append(f"From {rec_creator_name}, the creator behind {creator_counts[rec_creator]} of your picks.")
+        elif rec_creator_name:
+            reasoning_parts.append(f"From {rec_creator_name}, whose work you already picked.")
+        elif shared_genres:
             reasoning_parts.append(f"Expertly crafted {', '.join(shared_genres[:2]).lower()} storytelling that builds on your love for {user_tv_series[0].get('name', '')}.")
         else:
             reasoning_parts.append(f"Narrative excellence that resonates with your appreciation for {user_tv_series[0].get('name', '')} and {user_tv_series[1].get('name', '')}.")
-        
+
         # Add distinctive features
         rating = recommendation.get('vote_average', 0)
         air_year = recommendation.get('first_air_date', '')[:4]

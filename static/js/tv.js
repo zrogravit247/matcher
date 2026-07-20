@@ -75,13 +75,11 @@ class TVRecommendationApp {
         this.hideAllSuggestions();
         
         try {
-            this.userTVSeries = [];
-            for (const title of tvTitles) {
-                const tvShow = await this.searchTV(title);
-                if (tvShow) {
-                    this.userTVSeries.push(tvShow);
-                }
-            }
+            // Resolve all titles in parallel; sequential awaits here made the
+            // user wait for four round-trips before the recommendation even
+            // started.
+            const results = await Promise.all(tvTitles.map(title => this.searchTV(title)));
+            this.userTVSeries = results.filter(Boolean);
             
             if (this.userTVSeries.length < 4) {
                 this.showError('Could not find all TV series. Please check the titles and try again.');
@@ -137,7 +135,10 @@ class TVRecommendationApp {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ tv_series: this.userTVSeries })
+                body: JSON.stringify({
+                    tv_series: this.userTVSeries,
+                    feedback: FeedbackStore.all('tv')
+                })
             });
             
             if (!response.ok) {
@@ -320,8 +321,10 @@ class TVRecommendationApp {
 
     async handleLikeFeedback(liked) {
         if (!this.currentRecommendation) return;
-        
+
         this.updateFeedbackButtons(liked);
+        // Record before fetching the next one so this like/dislike shapes it.
+        await FeedbackStore.record('tv', this.currentRecommendation, liked);
         setTimeout(() => this.getAnotherRecommendation(), 1000);
     }
 
@@ -345,9 +348,38 @@ class TVRecommendationApp {
 
     async addToWatchlist() {
         if (!this.currentRecommendation) return;
-        
-        this.showSuccess('Added to watchlist!');
-        this.addToWatchlistBtn.classList.add('d-none');
+
+        try {
+            const response = await fetch('/add_to_watchlist', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    content_type: 'tv',
+                    id: this.currentRecommendation.id,
+                    title: this.currentRecommendation.name || this.currentRecommendation.title,
+                    release_date: this.currentRecommendation.first_air_date,
+                    poster_path: this.currentRecommendation.poster_path,
+                    overview: this.currentRecommendation.overview,
+                    vote_average: this.currentRecommendation.vote_average,
+                    genres: this.currentRecommendation.genres
+                })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                this.showSuccess('Added to watchlist!');
+                this.addToWatchlistBtn.classList.add('d-none');
+            } else {
+                this.showError(data.error || 'Failed to add to watchlist');
+            }
+
+        } catch (error) {
+            console.error('Error adding to watchlist:', error);
+            this.showError('Failed to add to watchlist');
+        }
     }
 
     resetApp() {
